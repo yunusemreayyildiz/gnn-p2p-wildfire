@@ -1,0 +1,301 @@
+# Single source of truth for all dataset schemas (v0.1, draft).
+# Parquet, Avro/JSON Schema (Kafka) and Pydantic definitions are generated from this file.
+# Open decisions are marked with "TODO(decision)".
+
+schema_version: "0.1"
+
+conventions:
+  time:
+    unit: seconds
+    reference: ignition time of the fire (t = 0)
+    note: All "t*" fields across all files share this clock, so they are directly comparable.
+  crs:
+    value: "EPSG:32635"   # UTM zone 35N; TODO(decision): confirm for the Mugla pilot area
+    note: Stored once here and in the dataset README, not per row.
+  nullability: "nullable: true means the value may be null; all other fields are required."
+  types: [string, int8, int16, int32, int64, float32, float64, bool, enum]
+  no_fire_info_in_telemetry: >
+    network_telemetry must not contain any fire-derived feature (flame length,
+    distance to fire front, etc.). RQ2 requires prediction from network telemetry only.
+
+tables:
+
+  # ---------------------------------------------------------------------------
+  scenario_manifest:
+    description: One row per simulation run. Links fire, deployment, protocol and split.
+    format: parquet
+    primary_key: [scenario_id]
+    fields:
+      scenario_id:
+        type: string
+        description: Unique run identifier, e.g. "F03_D2_S1_tree_R4".
+      fire_id:
+        type: string
+        description: Fire scenario identifier (wind, ignition point, weather conditions).
+      deployment_id:
+        type: string
+        description: Node deployment identifier (density, sink count, placement seed).
+      protocol:
+        type: enum
+        values: [flooding, tree, heed_like]
+        description: Routing / clustering strategy used in the run.
+      failure_model:
+        type: enum
+        values: [fire, random]
+        description: Node failure mechanism applied in the run.
+      seed:
+        type: int32
+        description: Seed of the network model run.
+      fire_seed:
+        type: int32
+        nullable: true
+        description: Seed of the fire model run; null if the fire model is deterministic.
+      split:
+        type: enum
+        values: [train, val, test]
+        description: >
+          Dataset split. Assigned at fire_id level so the same fire (terrain/wind
+          combination) never appears in both train and test.
+      code_commit_fire_model:
+        type: string
+        description: Git commit hash of the fire model used.
+      code_commit_network_model:
+        type: string
+        description: Git commit hash of the network model used.
+      schema_version:
+        type: string
+        description: Schema version this row conforms to.
+
+  # ---------------------------------------------------------------------------
+  nodes:
+    description: Static node properties. One file per deployment (nodes.csv).
+    format: csv
+    primary_key: [deployment_id, node_id]
+    fields:
+      deployment_id:
+        type: string
+        description: Deployment identifier (part 1 of the key).
+      node_id:
+        type: int32
+        description: Node identifier, unique within a deployment (part 2 of the key).
+      x:
+        type: float64
+        unit: m
+        description: Easting in the dataset CRS.
+      y:
+        type: float64
+        unit: m
+        description: Northing in the dataset CRS.
+      elevation_m:
+        type: float32
+        unit: m
+        description: Ground elevation sampled from the DEM.
+      role:
+        type: enum
+        values: [sensor, sink]
+        description: Node role.
+      fuel_model:
+        type: string
+        description: Scott & Burgan fuel model code of the node's cell (for failure modelling and error analysis).
+      tx_power_dbm:
+        type: float32
+        unit: dBm
+        description: Transmit power.
+      battery_init_j:
+        type: float32
+        unit: J
+        description: Initial battery energy.
+      sf_init:
+        type: int8
+        nullable: true
+        description: Initial LoRa spreading factor; null if not applicable to the simulator.
+
+  # ---------------------------------------------------------------------------
+  fire_trace:
+    description: Per-node fire arrival and failure times produced by the fire model (or the random failure generator).
+    format: parquet
+    primary_key: [fire_id, deployment_id, failure_model, node_id]
+    fields:
+      fire_id:
+        type: string
+        description: Fire scenario identifier (part 1 of the key).
+      deployment_id:
+        type: string
+        description: Deployment identifier (part 2 of the key).
+      failure_model:
+        type: enum
+        values: [fire, random]
+        description: Failure mechanism that produced this row (part 3 of the key).
+      node_id:
+        type: int32
+        description: Node identifier (part 4 of the key).
+      t_arrival_s:
+        type: float64
+        unit: s
+        nullable: true
+        description: Time the fire front reaches the node's cell; null if never reached or failure_model is random.
+      flame_length_m:
+        type: float32
+        unit: m
+        nullable: true
+        description: Flame length at arrival; null if never reached or failure_model is random.
+      t_fail_s:
+        type: float64
+        unit: s
+        nullable: true
+        description: Time the node stops working; null if it never fails.
+        # TODO(decision): t_fail_s = t_arrival_s, or arrival minus a radiant-heat margin / flame-length threshold?
+      fail_mode:
+        type: enum
+        values: [fire, random, none]
+        description: Mechanism that caused the failure; "none" if the node survives.
+    notes:
+      - >
+        For failure_model = random, the number and time distribution of failures should
+        be matched to the fire-based run so the RQ1 comparison is fair.
+        TODO(decision): matching method (same count / same time distribution / spatially random).
+
+  # ---------------------------------------------------------------------------
+  network_telemetry:
+    description: Per-node network state sampled at fixed intervals. Contains no fire information.
+    format: parquet
+    partitioning: scenario_id
+    primary_key: [scenario_id, node_id, t]
+    kafka:
+      topic: telemetry.raw
+      key: "{scenario_id}:{node_id}"
+      event_time_field: t
+      delivery: at-least-once
+      idempotency_key: [scenario_id, node_id, t]
+    fields:
+      schema_version:
+        type: string
+        description: Schema version of the row.
+      scenario_id:
+        type: string
+        description: Run identifier (foreign key to scenario_manifest).
+      seed:
+        type: int32
+        description: Network model seed (denormalized from scenario_manifest for convenience).
+      t:
+        type: float64
+        unit: s
+        description: Simulation time of the sample (end of the window).
+      node_id:
+        type: int32
+        description: Node identifier (foreign key to nodes).
+      window_s:
+        type: float32
+        unit: s
+        description: Length of the aggregation window ending at t.
+        # TODO(decision): sampling interval; constrained by LoRa duty cycle.
+      is_alive:
+        type: bool
+        description: Whether the node is operating at time t (includes fire-caused shutdown).
+      battery_j:
+        type: float32
+        unit: J
+        description: Remaining battery energy.
+      tx_energy_j:
+        type: float32
+        unit: J
+        description: Energy spent on transmission within the window.
+      parent_id:
+        type: int32
+        nullable: true
+        description: Parent node in tree-based routing; null for flooding or when no parent exists.
+      hop_to_sink:
+        type: int16
+        nullable: true
+        description: Hop count to the nearest sink; null if no route exists.
+      n_neighbors:
+        type: int16
+        description: Number of neighbors heard within the window.
+      rssi_mean_dbm:
+        type: float32
+        unit: dBm
+        nullable: true
+        description: Mean RSSI of packets received from neighbors in the window; null if none received.
+      snr_mean_db:
+        type: float32
+        unit: dB
+        nullable: true
+        description: Mean SNR of packets received from neighbors in the window; null if none received.
+      pdr_window:
+        type: float32
+        unit: ratio_0_1
+        nullable: true
+        description: Packet delivery ratio in the window; null if no packets were sent.
+      pkts_tx:
+        type: int32
+        description: Packets transmitted by the node (own and forwarded) in the window.
+      pkts_rx:
+        type: int32
+        description: Packets received by the node in the window.
+      pkts_fwd:
+        type: int32
+        description: Packets forwarded by the node in the window.
+      pkts_drop:
+        type: int32
+        description: Packets dropped by the node in the window.
+      queue_len:
+        type: int16
+        description: Transmit queue length at time t.
+      latency_mean_s:
+        type: float32
+        unit: s
+        nullable: true
+        description: Mean end-to-end latency of packets delivered in the window; null if none delivered.
+
+  # ---------------------------------------------------------------------------
+  link_failure_labels:
+    description: >
+      Prediction targets derived from network_telemetry + fire_trace + nodes.
+      Kept in a separate table so labels can never leak into features.
+    format: parquet
+    primary_key: [scenario_id, node_id, t, horizon_s]
+    fields:
+      scenario_id:
+        type: string
+        description: Run identifier.
+      node_id:
+        type: int32
+        description: Node identifier.
+      t:
+        type: float64
+        unit: s
+        description: Prediction time (matches network_telemetry.t).
+      horizon_s:
+        type: float32
+        unit: s
+        description: Prediction horizon H in seconds.
+        # TODO(decision): single value or at least two horizons for lead-time analysis.
+      y_disconnect:
+        type: bool
+        description: True if the node loses its route to every sink within (t, t + horizon_s].
+        # TODO(decision): node-level (sink reachability) vs link-level failure definition.
+      t_disconnect_s:
+        type: float64
+        unit: s
+        nullable: true
+        description: Actual time the node loses sink reachability; null if it never does. Used for lead-time computation.
+      cause:
+        type: enum
+        values: [fire, random, energy, topology, none]
+        description: Cause of the disconnection (fire or random node failure, energy depletion, topology change such as a failed parent). Error analysis only; never a model input.
+
+# -----------------------------------------------------------------------------
+messages:
+  predictions_link_failure:
+    description: Kafka message emitted by the online inference consumer (optional replay layer).
+    kafka:
+      topic: predictions.link_failure
+      key: "{scenario_id}:{node_id}"
+      event_time_field: t
+    fields:
+      scenario_id: {type: string, description: Run identifier.}
+      node_id: {type: int32, description: Node identifier.}
+      t: {type: float64, unit: s, description: Prediction time.}
+      horizon_s: {type: float32, unit: s, description: Prediction horizon.}
+      p_disconnect: {type: float32, unit: ratio_0_1, description: Predicted probability of disconnection within the horizon.}
+      model_version: {type: string, description: Identifier of the trained model that produced the prediction.}
